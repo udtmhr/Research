@@ -13,6 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+[project]
+name = "gsplat"
+version = "0.1.0"
+description = "Python package for differentiable rasterization of gaussians"
+requires-python = ">=3.11"
+dependencies = [
+    "ninja",
+    "numpy",
+    "jaxtyping",
+    "rich>=12",
+    "torch",
+    "tyro",
+    "viser",
+    "torchmetrics",
+    "tqdm",
+    "pyyaml",
+    "imageio",
+    "scipy",
+    "lpips",
+]
+
 [build-system]
 requires = [
     "setuptools>=42",
