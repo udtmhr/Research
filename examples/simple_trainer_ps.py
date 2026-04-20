@@ -905,6 +905,10 @@ class Runner:
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            alpha_gt = None
+            if pixels.shape[-1] == 4:
+                alpha_gt = pixels[..., 3:4]
+                pixels = pixels[..., :3]
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
@@ -952,6 +956,8 @@ class Runner:
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
+                if alpha_gt is not None:
+                    pixels = pixels * alpha_gt + bkgd * (1.0 - alpha_gt)
 
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
@@ -1337,6 +1343,8 @@ class Runner:
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
             pixels = data["image"].to(device) / 255.0
+            if pixels.shape[-1] == 4:
+                pixels = pixels[..., :3]
             masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
 
