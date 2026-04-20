@@ -19,19 +19,8 @@ version = "0.1.0"
 description = "Python package for differentiable rasterization of gaussians"
 requires-python = ">=3.11"
 dependencies = [
-    "ninja",
-    "numpy",
-    "jaxtyping",
-    "rich>=12",
-    "torch",
-    "tyro",
-    "viser",
-    "torchmetrics",
-    "tqdm",
-    "pyyaml",
-    "imageio",
-    "scipy",
-    "lpips",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
 ]
 
 [build-system]
@@ -44,4 +33,7 @@ requires = [
     "rich",
 ]
 build-backend = "setuptools.build_meta"
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu128"
 

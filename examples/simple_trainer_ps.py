@@ -139,6 +139,10 @@ class Config:
     lambda_ref_diff: float = 0.01
     lambda_ref_spec: float = 0.01
     lambda_ref_kl: float = 0.01
+    # Morton Orderソート後、各サンプルの前後何個を近傍とするか（片側）
+    smoothing_neighbors_k: int = 2
+    # 平滑化ロスに使うサンプル数
+    smoothing_sample_size: int = 10000
     # Initial opacity of GS
     init_opa: float = 0.1
     # Initial scale of GS
@@ -358,6 +362,29 @@ def create_splats_with_optimizers(
         for name, _, lr in params
     }
     return splats, optimizers
+
+
+def _expand_bits_32(v: torch.Tensor) -> torch.Tensor:
+    """10ビット整数の各ビット間に0を2つ挟み、30ビットに拡張する。
+    Morton Code算出のためのビットインターリーブの前処理。
+    入力: [N] (int64 tensor, 値は 0〜1023)
+    出力: [N] (int64 tensor, 拡張後のビット列)
+    """
+    v = v.long()
+    v = (v | (v << 16)) & 0x030000FF
+    v = (v | (v << 8))  & 0x0300F00F
+    v = (v | (v << 4))  & 0x030C30C3
+    v = (v | (v << 2))  & 0x09249249
+    return v
+
+
+def _morton3D(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """3次元の10ビット整数座標からMorton Code（Z-order値）を算出する。
+    空間充填曲線によって、3D空間の近接性を1D整数に保存する。
+    入力: x, y, z それぞれ [N] (0〜1023)
+    出力: [N] (int64 Morton code)
+    """
+    return (_expand_bits_32(x) << 2) | (_expand_bits_32(y) << 1) | _expand_bits_32(z)
 
 
 class Runner:
@@ -982,44 +1009,111 @@ class Runner:
                 )
                 loss += post_processing_reg_loss
 
-            # PS Hybrid Smoothing Loss
+
+            # PS Hybrid Smoothing Loss（Morton Orderベース近傍ペアリング）
             if cfg.lambda_ref_diff > 0.0 or cfg.lambda_ref_spec > 0.0 or cfg.lambda_ref_kl > 0.0:
                 num_splats = self.splats["means"].shape[0]
-                sampled_size = min(10000, num_splats)
-                if sampled_size > 4:
-                    # Random sampling
-                    sampled_indices = torch.randint(0, num_splats, (sampled_size,), device=device)
-                    
-                    # Compute distances among sampled means
-                    m_sampled = self.splats["means"][sampled_indices] # [S, 3]
-                    dist_matrix = torch.cdist(m_sampled, m_sampled) # [S, S]
-                    
-                    # Get top K nearest neighbors (K=4, ignoring self which is index 0)
-                    K = 4
-                    _, nn_indices = torch.topk(dist_matrix, K+1, dim=-1, largest=False)
-                    nn_indices = nn_indices[:, 1:] # [S, K]
-                    
-                    # Fetch parameters for sampled splats
-                    c_diff_s = torch.sigmoid(self.splats["c_diff"])[sampled_indices] # [S, 3]
-                    c_spec_s = torch.sigmoid(self.splats["c_spec"])[sampled_indices] # [S, 3]
-                    kappa_s = self.splats["kappa"][sampled_indices] # [S, 1]
-                    
-                    q_s = F.normalize(self.splats["quats"][sampled_indices], dim=-1)
-                    mus_x = 2 * (q_s[..., 1] * q_s[..., 3] + q_s[..., 0] * q_s[..., 2])
-                    mus_y = 2 * (q_s[..., 2] * q_s[..., 3] - q_s[..., 0] * q_s[..., 1])
-                    mus_z = 1 - 2 * (q_s[..., 1]**2 + q_s[..., 2]**2)
-                    mus_s = torch.stack([mus_x, mus_y, mus_z], dim=-1) # [S, 3]
-                    
-                    # Compute L1 differences with neighbors
-                    # [S, 1, 3] - [S, K, 3]
-                    diff_diff = torch.abs(c_diff_s.unsqueeze(1) - c_diff_s[nn_indices]).mean()
-                    spec_diff = torch.abs(c_spec_s.unsqueeze(1) - c_spec_s[nn_indices]).mean()
-                    
-                    # Compute KL divergence upper bound for directions: kappa * (1 - mu_i . mu_j)
-                    # mu_i: [S, 1, 3], mu_j: [S, K, 3]
-                    cos_theta = (mus_s.unsqueeze(1) * mus_s[nn_indices]).sum(dim=-1) # [S, K]
-                    kl_bound = (kappa_s * (1.0 - cos_theta)).mean()
-                    
+                half_k = cfg.smoothing_neighbors_k  # 片側の近傍数
+                total_k = half_k * 2  # 両側合計の近傍数
+                sampled_size = min(cfg.smoothing_sample_size, num_splats - total_k)
+                if sampled_size > total_k:
+                    # --- Morton Orderによる空間ソート ---
+                    with torch.no_grad():
+                        means_detached = self.splats["means"].detach()
+                        # 座標を [0, 1] に正規化
+                        mins = means_detached.min(dim=0).values
+                        maxs = means_detached.max(dim=0).values
+                        extent = (maxs - mins).clamp(min=1e-6)
+                        normalized = (means_detached - mins) / extent  # [N, 3]
+                        # 10ビット精度の整数に量子化（0〜1023）
+                        quantized = (normalized * 1023.0).long().clamp(0, 1023)  # [N, 3]
+                        # Morton Code算出: ビットインターリーブ
+                        morton_codes = _morton3D(
+                            quantized[:, 0], quantized[:, 1], quantized[:, 2]
+                        )
+                        # Z-orderでソートし、空間的に隣接する順列を取得
+                        sorted_indices = torch.argsort(morton_codes)
+
+                    # ソート済み配列からランダムにサンプル位置を選ぶ
+                    # 端の half_k 個を避けることで、前後に確実に近傍が存在する
+                    sample_positions = torch.randint(
+                        half_k, num_splats - half_k,
+                        (sampled_size,), device=device
+                    )
+
+                    # 各サンプルの前後 half_k 個を近傍としてペアリング
+                    # offsets: [-half_k, ..., -1, +1, ..., +half_k]
+                    offsets = torch.cat([
+                        torch.arange(-half_k, 0, device=device),
+                        torch.arange(1, half_k + 1, device=device),
+                    ])  # [total_k]
+                    # neighbor_positions: [S, total_k]
+                    neighbor_positions = sample_positions.unsqueeze(1) + offsets.unsqueeze(0)
+
+                    # ソート済み配列上のインデックスから元のガウシアンインデックスに変換
+                    center_indices = sorted_indices[sample_positions]        # [S]
+                    neighbor_indices = sorted_indices[neighbor_positions]    # [S, total_k]
+
+                    # --- パラメータ取得 ---
+                    c_diff_all = torch.sigmoid(self.splats["c_diff"])
+                    c_spec_all = torch.sigmoid(self.splats["c_spec"])
+
+                    c_diff_center = c_diff_all[center_indices]      # [S, 3]
+                    c_spec_center = c_spec_all[center_indices]      # [S, 3]
+                    c_diff_neigh = c_diff_all[neighbor_indices]     # [S, K, 3]
+                    c_spec_neigh = c_spec_all[neighbor_indices]     # [S, K, 3]
+
+                    kappa_center = self.splats["kappa"][center_indices]    # [S, 1]
+                    kappa_neigh = self.splats["kappa"][neighbor_indices]   # [S, K, 1]
+
+                    q_center = F.normalize(self.splats["quats"][center_indices], dim=-1)
+                    q_neigh = F.normalize(self.splats["quats"][neighbor_indices], dim=-1)
+
+                    # クォータニオンから法線ベクトル mu を算出
+                    def _quat_to_mu(q: torch.Tensor) -> torch.Tensor:
+                        """クォータニオン [qr, qx, qy, qz] からZ軸方向ベクトルを抽出"""
+                        qr, qx, qy, qz = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+                        mu_x = 2 * (qx * qz + qr * qy)
+                        mu_y = 2 * (qy * qz - qr * qx)
+                        mu_z = 1 - 2 * (qx * qx + qy * qy)
+                        return torch.stack([mu_x, mu_y, mu_z], dim=-1)
+
+                    mu_center = _quat_to_mu(q_center)  # [S, 3]
+                    mu_neigh = _quat_to_mu(q_neigh)    # [S, K, 3]
+
+                    # --- L1色差 ---
+                    diff_diff = torch.abs(
+                        c_diff_center.unsqueeze(1) - c_diff_neigh
+                    ).mean()
+                    spec_diff = torch.abs(
+                        c_spec_center.unsqueeze(1) - c_spec_neigh
+                    ).mean()
+
+                    # --- 対称KLダイバージェンス上界 ---
+                    kappa_i = torch.clamp(kappa_center.unsqueeze(1), min=0.0)  # [S, 1, 1]
+                    kappa_j = torch.clamp(kappa_neigh, min=0.0)               # [S, K, 1]
+
+                    cos_theta = (mu_center.unsqueeze(1) * mu_neigh).sum(
+                        dim=-1, keepdim=True
+                    )  # [S, K, 1]
+                    dot_term = torch.clamp((1.0 + cos_theta) / 2.0, min=1e-5, max=1.0)
+
+                    # U_{KL}(i || j)
+                    term1_ij = torch.log((kappa_i + 1.0) / (kappa_j + 1.0))
+                    term2_ij = (kappa_i - kappa_j) / (kappa_i + 1.0)
+                    term3_ij = kappa_j * torch.log(dot_term)
+                    u_kl_ij = term1_ij - term2_ij - term3_ij
+
+                    # U_{KL}(j || i)
+                    term1_ji = torch.log((kappa_j + 1.0) / (kappa_i + 1.0))
+                    term2_ji = (kappa_j - kappa_i) / (kappa_j + 1.0)
+                    term3_ji = kappa_i * torch.log(dot_term)
+                    u_kl_ji = term1_ji - term2_ji - term3_ji
+
+                    # 対称化 S_{KL}
+                    s_kl = 0.5 * (u_kl_ij + u_kl_ji)
+                    kl_bound = s_kl.mean()
+
                     loss += cfg.lambda_ref_diff * diff_diff
                     loss += cfg.lambda_ref_spec * spec_diff
                     loss += cfg.lambda_ref_kl * kl_bound
@@ -1047,7 +1141,7 @@ class Runner:
             #     canvas = canvas.reshape(-1, *canvas.shape[2:])
             #     imageio.imwrite(
             #         f"{self.render_dir}/train_rank{self.world_rank}.png",
-            #         (canvas * 255).astype(np.uint8),
+            #         (canvas * # PS Hybrid Smoothing Loss255).astype(np.uint8),
             #     )
 
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:

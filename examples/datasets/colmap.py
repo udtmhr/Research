@@ -216,7 +216,27 @@ class Parser:
             )
             image_files = sorted(_get_rel_paths(image_dir))
         colmap_to_image = dict(zip(colmap_files, image_files))
-        image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
+        # COLMAPが記録した拡張子と実ファイルの拡張子が異なる場合（例: .jpg vs .png）、
+        # ベース名（拡張子なし）でフォールバックマッチングを行う
+        if image_names and image_names[0] not in colmap_to_image:
+            stem_to_image = {
+                os.path.splitext(f)[0]: f for f in image_files
+            }
+            image_paths = []
+            for f in image_names:
+                if f in colmap_to_image:
+                    image_paths.append(os.path.join(image_dir, colmap_to_image[f]))
+                else:
+                    stem = os.path.splitext(f)[0]
+                    if stem in stem_to_image:
+                        image_paths.append(os.path.join(image_dir, stem_to_image[stem]))
+                    else:
+                        raise KeyError(
+                            f"Image '{f}' from COLMAP not found on disk. "
+                            f"Available stems: {list(stem_to_image.keys())[:5]}..."
+                        )
+        else:
+            image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
 
         # 3D points and {image_name -> [point_idx]}
         points = manager.points3D.astype(np.float32)
@@ -292,6 +312,12 @@ class Parser:
             exposure_values: List[Optional[float]] = []
             for image_name in tqdm(image_names, desc="Loading EXIF exposure"):
                 original_path = Path(colmap_image_dir) / image_name
+                # COLMAPが記録した拡張子と実ファイルが異なる場合のフォールバック
+                if not original_path.exists():
+                    candidates = list(Path(colmap_image_dir).glob(
+                        original_path.stem + ".*"
+                    ))
+                    original_path = candidates[0] if candidates else original_path
                 exposure_values.append(compute_exposure_from_exif(original_path))
 
             # Compute mean across all valid exposures and subtract
