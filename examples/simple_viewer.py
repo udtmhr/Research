@@ -37,6 +37,7 @@ def main(local_rank: int, world_rank, world_size: int, args):
     torch.manual_seed(42)
     device = torch.device("cuda", local_rank)
 
+    is_ps = False
     if args.ckpt is None:
         (
             means,
@@ -115,23 +116,38 @@ def main(local_rank: int, world_rank, world_size: int, args):
             (canvas * 255).astype(np.uint8),
         )
     else:
-        means, quats, scales, opacities, sh0, shN = [], [], [], [], [], []
+        means, quats, scales, opacities = [], [], [], []
+        sh0, shN = [], []
+        c_diff, c_spec, kappa = [], [], []
         for ckpt_path in args.ckpt:
             ckpt = torch.load(ckpt_path, map_location=device)["splats"]
             means.append(ckpt["means"])
             quats.append(F.normalize(ckpt["quats"], p=2, dim=-1))
             scales.append(torch.exp(ckpt["scales"]))
             opacities.append(torch.sigmoid(ckpt["opacities"]))
-            sh0.append(ckpt["sh0"])
-            shN.append(ckpt["shN"])
+            if "sh0" in ckpt:
+                sh0.append(ckpt["sh0"])
+                shN.append(ckpt["shN"])
+            elif "c_diff" in ckpt:
+                is_ps = True
+                c_diff.append(torch.sigmoid(ckpt["c_diff"]))
+                c_spec.append(torch.sigmoid(ckpt["c_spec"]))
+                kappa.append(ckpt["kappa"])
         means = torch.cat(means, dim=0)
         quats = torch.cat(quats, dim=0)
         scales = torch.cat(scales, dim=0)
         opacities = torch.cat(opacities, dim=0)
-        sh0 = torch.cat(sh0, dim=0)
-        shN = torch.cat(shN, dim=0)
-        colors = torch.cat([sh0, shN], dim=-2)
-        sh_degree = int(math.sqrt(colors.shape[-2]) - 1)
+        if not is_ps:
+            sh0 = torch.cat(sh0, dim=0)
+            shN = torch.cat(shN, dim=0)
+            colors = torch.cat([sh0, shN], dim=-2)
+            sh_degree = int(math.sqrt(colors.shape[-2]) - 1)
+        else:
+            c_diff = torch.cat(c_diff, dim=0)
+            c_spec = torch.cat(c_spec, dim=0)
+            kappa = torch.cat(kappa, dim=0)
+            colors = None
+            sh_degree = None
         print("Number of Gaussians:", len(means))
 
     # register and open viewer
@@ -157,12 +173,31 @@ def main(local_rank: int, world_rank, world_size: int, args):
             "alpha": "RGB",
         }
 
+        if is_ps:
+            q = F.normalize(quats, dim=-1)
+            qr, qx, qy, qz = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+            mu_x = 2 * (qx * qz + qr * qy)
+            mu_y = 2 * (qy * qz - qr * qx)
+            mu_z = 1 - 2 * (qx * qx + qy * qy)
+            mu = torch.stack([mu_x, mu_y, mu_z], dim=-1)
+
+            cam_pos = c2w[:3, 3]
+            v = cam_pos.unsqueeze(0) - means
+            v = F.normalize(v, dim=-1)
+
+            mu_dot_v = (mu * v).sum(dim=-1, keepdim=True)
+            
+            current_colors = c_diff + c_spec * torch.clamp((1 + mu_dot_v) / 2.0, min=1e-6) ** kappa
+            current_colors = torch.clamp(current_colors, 0.0, 1.0)
+        else:
+            current_colors = colors
+
         render_colors, render_alphas, info = rasterization(
             means,  # [N, 3]
             quats,  # [N, 4]
             scales,  # [N, 3]
             opacities,  # [N]
-            colors,  # [N, S, 3]
+            current_colors,  # [N, S, 3] or [N, 3]
             viewmat[None],  # [1, 4, 4]
             K[None],  # [1, 3, 3]
             width,
