@@ -57,6 +57,19 @@ from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
+def rgb_to_ycbcr(image: torch.Tensor) -> torch.Tensor:
+    """Convert RGB image to YCbCr."""
+    matrix = torch.tensor(
+        [[ 0.299,  0.587,  0.114],
+         [-0.168736, -0.331264,  0.5],
+         [ 0.5, -0.418688, -0.081312]],
+        dtype=image.dtype,
+        device=image.device,
+    )
+    ycbcr = torch.matmul(image, matrix.T)
+    ycbcr[..., 1:] += 0.5
+    return ycbcr
+
 
 @dataclass
 class Config:
@@ -135,14 +148,10 @@ class Config:
     init_num_pts: int = 100_000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
-    # Weights for the PS Hybrid Smoothing Loss
-    lambda_ref_diff: float = 0.1
-    lambda_ref_spec: float = 0.1
-    lambda_ref_kl: float = 0.1
-    # Morton Orderソート後、各サンプルの前後何個を近傍とするか（片側）
-    smoothing_neighbors_k: int = 2
-    # 平滑化ロスに使うサンプル数
-    smoothing_sample_size: int = 10000
+    # Degree of spherical harmonics
+    sh_degree: int = 3
+    # Turn on another SH degree every this steps
+    sh_degree_interval: int = 1000
     # Initial opacity of GS
     init_opa: float = 0.1
     # Initial scale of GS
@@ -179,12 +188,10 @@ class Config:
     opacities_lr: float = 5e-2
     # LR for orientation (quaternions)
     quats_lr: float = 1e-3
-    # LR for PS diffusion color
-    cdiff_lr: float = 2.5e-3
-    # LR for PS specular color
-    cspec_lr: float = 1e-3
-    # LR for PS sharpness
-    kappa_lr: float = 1e-2
+    # LR for SH band 0 (brightness)
+    sh0_lr: float = 2.5e-3
+    # LR for higher-order SH (detail)
+    shN_lr: float = 2.5e-3 / 20
 
     # Opacity regularization
     opacity_reg: float = 0.0
@@ -247,6 +254,7 @@ class Config:
         self.save_steps = [int(i * factor) for i in self.save_steps]
         self.ply_steps = [int(i * factor) for i in self.ply_steps]
         self.max_steps = int(self.max_steps * factor)
+        self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
         strategy = self.strategy
         if isinstance(strategy, DefaultStrategy):
@@ -277,10 +285,10 @@ def create_splats_with_optimizers(
     scales_lr: float = 5e-3,
     opacities_lr: float = 5e-2,
     quats_lr: float = 1e-3,
-    cdiff_lr: float = 2.5e-3,
-    cspec_lr: float = 1e-3,
-    kappa_lr: float = 1e-2,
+    sh0_lr: float = 2.5e-3,
+    shN_lr: float = 2.5e-3 / 20,
     scene_scale: float = 1.0,
+    sh_degree: int = 3,
     sparse_grad: bool = False,
     visible_adam: bool = False,
     batch_size: int = 1,
@@ -321,22 +329,17 @@ def create_splats_with_optimizers(
     ]
 
     if feature_dim is None:
-        # Initial colors
-        c_diff = torch.logit(rgbs.clamp(min=1e-3, max=1-1e-3))  # [N, 3]
-        c_spec = torch.logit(torch.full((N, 3, 3), 0.05)) # Small initial specular
-        kappa = torch.full((N, 3), 10.0) # initial sharpness
-        
-        params.extend([
-            ("c_diff", torch.nn.Parameter(c_diff), cdiff_lr),
-            ("c_spec", torch.nn.Parameter(c_spec), cspec_lr),
-            ("kappa", torch.nn.Parameter(kappa), kappa_lr),
-        ])
+        # color is SH coefficients.
+        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
+        colors[:, 0, :] = rgb_to_sh(rgbs)
+        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
+        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
-        params.append(("features", torch.nn.Parameter(features), cdiff_lr))
-        colors = torch.logit(rgbs.clamp(min=1e-3, max=1-1e-3))  # [N, 3]
-        params.append(("colors", torch.nn.Parameter(colors), cdiff_lr))
+        params.append(("features", torch.nn.Parameter(features), sh0_lr))
+        colors = torch.logit(rgbs)  # [N, 3]
+        params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
@@ -362,29 +365,6 @@ def create_splats_with_optimizers(
         for name, _, lr in params
     }
     return splats, optimizers
-
-
-def _expand_bits_32(v: torch.Tensor) -> torch.Tensor:
-    """10ビット整数の各ビット間に0を2つ挟み、30ビットに拡張する。
-    Morton Code算出のためのビットインターリーブの前処理。
-    入力: [N] (int64 tensor, 値は 0〜1023)
-    出力: [N] (int64 tensor, 拡張後のビット列)
-    """
-    v = v.long()
-    v = (v | (v << 16)) & 0x030000FF
-    v = (v | (v << 8))  & 0x0300F00F
-    v = (v | (v << 4))  & 0x030C30C3
-    v = (v | (v << 2))  & 0x09249249
-    return v
-
-
-def _morton3D(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-    """3次元の10ビット整数座標からMorton Code（Z-order値）を算出する。
-    空間充填曲線によって、3D空間の近接性を1D整数に保存する。
-    入力: x, y, z それぞれ [N] (0〜1023)
-    出力: [N] (int64 Morton code)
-    """
-    return (_expand_bits_32(x) << 2) | (_expand_bits_32(y) << 1) | _expand_bits_32(z)
 
 
 class Runner:
@@ -499,10 +479,10 @@ class Runner:
             scales_lr=cfg.scales_lr,
             opacities_lr=cfg.opacities_lr,
             quats_lr=cfg.quats_lr,
-            cdiff_lr=cfg.cdiff_lr,
-            cspec_lr=cfg.cspec_lr,
-            kappa_lr=cfg.kappa_lr,
+            sh0_lr=cfg.sh0_lr,
+            shN_lr=cfg.shN_lr,
             scene_scale=self.scene_scale,
+            sh_degree=cfg.sh_degree,
             sparse_grad=cfg.sparse_grad,
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
@@ -557,7 +537,7 @@ class Runner:
         if cfg.app_opt:
             assert feature_dim is not None
             self.app_module = AppearanceOptModule(
-                len(self.trainset), feature_dim, cfg.app_embed_dim, 0
+                len(self.trainset), feature_dim, cfg.app_embed_dim, cfg.sh_degree
             ).to(self.device)
             # initialize the last layer to be zero so that the initial output is zero.
             torch.nn.init.zeros_(self.app_module.color_head[-1].weight)
@@ -670,44 +650,24 @@ class Runner:
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
+        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
+        # rasterization does normalization internally
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
-            sh_deg = kwargs.pop("sh_degree", 0) # Fallback to 0 if not handled
             colors = self.app_module(
                 features=self.splats["features"],
                 embed_ids=image_ids,
                 dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
-                sh_degree=sh_deg,
+                sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
             )
             colors = colors + self.splats["colors"]
             colors = torch.sigmoid(colors)
         else:
-            kwargs["sh_degree"] = None # We do not use SH.
-
-            # Power Spherical Reflection
-            c_diff = torch.sigmoid(self.splats["c_diff"]) # [N, 3]
-            c_spec = torch.sigmoid(self.splats["c_spec"]) # [N, 3, 3]
-            kappa = self.splats["kappa"] # [N, 3]
-            
-            cam_pos = camtoworlds[:, :3, 3] # [C, 3]
-            v = cam_pos.unsqueeze(1) - means.unsqueeze(0) # [C, N, 3]
-            v = F.normalize(v, dim=-1) # [C, N, 3]
-
-            # 3つの直交軸 mu_i は世界座標系のX, Y, Z軸に固定されるため、
-            # mu_i^T v は単に v_x, v_y, v_z となる。
-            half_one_plus_v = torch.clamp((1.0 + v) / 2.0, min=1e-6) # [C, N, 3]
-            pow_term = half_one_plus_v ** kappa.unsqueeze(0) # [C, N, 3]
-
-            # 正規化定数 (kappa + 1) / 4pi を適用
-            # c_spec は [N, 3, 3], pow_term は [C, N, 3], kappa は [N, 3]
-            specular = (c_spec.unsqueeze(0) * ((kappa.unsqueeze(0).unsqueeze(-1) + 1.0) / (4.0 * math.pi)) * pow_term.unsqueeze(-1)).sum(dim=2) # [C, N, 3]
-            
-            colors = c_diff.unsqueeze(0) + specular
-            colors = torch.clamp(colors, 0.0, 1.0) # [C, N, 3]
+            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
 
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
@@ -927,8 +887,8 @@ class Runner:
             if cfg.pose_opt:
                 camtoworlds = self.pose_adjust(camtoworlds, image_ids)
 
-            # sh schedule not used
-            sh_degree_to_use = 0
+            # sh schedule
+            sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
             # forward
             renders, alphas, info = self.rasterize_splats(
@@ -966,17 +926,19 @@ class Runner:
             )
 
             # loss
+            colors_ycbcr = rgb_to_ycbcr(colors)
+            pixels_ycbcr = rgb_to_ycbcr(pixels)
             if masks is not None:
                 # Exclude masked pixels (e.g. ego vehicle) from L1.
                 # For SSIM (patch-based), zero out both sides at masked locations
                 # so masked patches don't pull colors toward an arbitrary value.
-                l1loss = F.l1_loss(colors[masks], pixels[masks])
-                colors_ssim = colors * masks[..., None]
-                pixels_ssim = pixels * masks[..., None]
+                l1loss = F.l1_loss(colors_ycbcr[masks], pixels_ycbcr[masks])
+                colors_ssim = colors_ycbcr * masks[..., None]
+                pixels_ssim = pixels_ycbcr * masks[..., None]
             else:
-                l1loss = F.l1_loss(colors, pixels)
-                colors_ssim = colors
-                pixels_ssim = pixels
+                l1loss = F.l1_loss(colors_ycbcr, pixels_ycbcr)
+                colors_ssim = colors_ycbcr
+                pixels_ssim = pixels_ycbcr
             ssimloss = 1.0 - fused_ssim(
                 colors_ssim.permute(0, 3, 1, 2),
                 pixels_ssim.permute(0, 3, 1, 2),
@@ -1013,95 +975,6 @@ class Runner:
                 )
                 loss += post_processing_reg_loss
 
-
-            # PS Hybrid Smoothing Loss（Morton Orderベース近傍ペアリング）
-            if cfg.lambda_ref_diff > 0.0 or cfg.lambda_ref_spec > 0.0 or cfg.lambda_ref_kl > 0.0:
-                num_splats = self.splats["means"].shape[0]
-                half_k = cfg.smoothing_neighbors_k  # 片側の近傍数
-                total_k = half_k * 2  # 両側合計の近傍数
-                sampled_size = min(cfg.smoothing_sample_size, num_splats - total_k)
-                if sampled_size > total_k:
-                    # --- Morton Orderによる空間ソート ---
-                    with torch.no_grad():
-                        means_detached = self.splats["means"].detach()
-                        # 座標を [0, 1] に正規化
-                        mins = means_detached.min(dim=0).values
-                        maxs = means_detached.max(dim=0).values
-                        extent = (maxs - mins).clamp(min=1e-6)
-                        normalized = (means_detached - mins) / extent  # [N, 3]
-                        # 10ビット精度の整数に量子化（0〜1023）
-                        quantized = (normalized * 1023.0).long().clamp(0, 1023)  # [N, 3]
-                        # Morton Code算出: ビットインターリーブ
-                        morton_codes = _morton3D(
-                            quantized[:, 0], quantized[:, 1], quantized[:, 2]
-                        )
-                        # Z-orderでソートし、空間的に隣接する順列を取得
-                        sorted_indices = torch.argsort(morton_codes)
-
-                    # ソート済み配列からランダムにサンプル位置を選ぶ
-                    # 端の half_k 個を避けることで、前後に確実に近傍が存在する
-                    sample_positions = torch.randint(
-                        half_k, num_splats - half_k,
-                        (sampled_size,), device=device
-                    )
-
-                    # 各サンプルの前後 half_k 個を近傍としてペアリング
-                    # offsets: [-half_k, ..., -1, +1, ..., +half_k]
-                    offsets = torch.cat([
-                        torch.arange(-half_k, 0, device=device),
-                        torch.arange(1, half_k + 1, device=device),
-                    ])  # [total_k]
-                    # neighbor_positions: [S, total_k]
-                    neighbor_positions = sample_positions.unsqueeze(1) + offsets.unsqueeze(0)
-
-                    # ソート済み配列上のインデックスから元のガウシアンインデックスに変換
-                    center_indices = sorted_indices[sample_positions]        # [S]
-                    neighbor_indices = sorted_indices[neighbor_positions]    # [S, total_k]
-
-                    # --- パラメータ取得 ---
-                    c_diff_all = torch.sigmoid(self.splats["c_diff"])
-                    c_spec_all = torch.sigmoid(self.splats["c_spec"])
-
-                    c_diff_center = c_diff_all[center_indices]      # [S, 3]
-                    c_spec_center = c_spec_all[center_indices]      # [S, 3]
-                    c_diff_neigh = c_diff_all[neighbor_indices]     # [S, K, 3]
-                    c_spec_neigh = c_spec_all[neighbor_indices]     # [S, K, 3]
-
-                    kappa_center = self.splats["kappa"][center_indices]    # [S, 1]
-                    kappa_neigh = self.splats["kappa"][neighbor_indices]   # [S, K, 1]
-
-                    # --- L1色差 ---
-                    diff_diff = torch.abs(
-                        c_diff_center.unsqueeze(1) - c_diff_neigh
-                    ).mean()
-                    spec_diff = torch.abs(
-                        c_spec_center.unsqueeze(1) - c_spec_neigh
-                    ).mean()
-
-                    # --- 対称KLダイバージェンス上界 ---
-                    # 軸が世界座標系に固定されたため、同一軸間のなす角は0（cos_theta=1）となる。
-                    # そのため dot_term = 1 となり log(dot_term) = 0 になるため省略可能。
-                    kappa_i = torch.clamp(kappa_center.unsqueeze(1), min=0.0)  # [S, 1, 3]
-                    kappa_j = torch.clamp(kappa_neigh, min=0.0)               # [S, K, 3]
-
-                    # U_{KL}(i || j)
-                    term1_ij = torch.log((kappa_i + 1.0) / (kappa_j + 1.0))
-                    term2_ij = (kappa_i - kappa_j) / (kappa_i + 1.0)
-                    u_kl_ij = term1_ij - term2_ij
-
-                    # U_{KL}(j || i)
-                    term1_ji = torch.log((kappa_j + 1.0) / (kappa_i + 1.0))
-                    term2_ji = (kappa_j - kappa_i) / (kappa_j + 1.0)
-                    u_kl_ji = term1_ji - term2_ji
-
-                    # 対称化 S_{KL}
-                    s_kl = 0.5 * (u_kl_ij + u_kl_ji)
-                    kl_bound = s_kl.sum(dim=-1).mean()
-
-                    loss += cfg.lambda_ref_diff * diff_diff
-                    loss += cfg.lambda_ref_spec * spec_diff
-                    loss += cfg.lambda_ref_kl * kl_bound
-
             # regularizations
             if cfg.opacity_reg > 0.0:
                 loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
@@ -1125,7 +998,7 @@ class Runner:
             #     canvas = canvas.reshape(-1, *canvas.shape[2:])
             #     imageio.imwrite(
             #         f"{self.render_dir}/train_rank{self.world_rank}.png",
-            #         (canvas * # PS Hybrid Smoothing Loss255).astype(np.uint8),
+            #         (canvas * 255).astype(np.uint8),
             #     )
 
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
@@ -1196,9 +1069,8 @@ class Runner:
                     sh0 = rgb_to_sh(rgb)
                     shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
                 else:
-                    rgb = torch.sigmoid(self.splats["c_diff"]).unsqueeze(1)
-                    sh0 = rgb_to_sh(rgb)
-                    shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
+                    sh0 = self.splats["sh0"]
+                    shN = self.splats["shN"]
 
                 means = self.splats["means"]
                 scales = self.splats["scales"]
@@ -1336,7 +1208,7 @@ class Runner:
                 Ks=Ks,
                 width=width,
                 height=height,
-                sh_degree=0,
+                sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 masks=masks,
@@ -1466,7 +1338,7 @@ class Runner:
                 Ks=Ks,
                 width=width,
                 height=height,
-                sh_degree=0,
+                sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 render_mode="RGB+ED",
@@ -1559,7 +1431,7 @@ class Runner:
             Ks=K[None],
             width=width,
             height=height,
-            sh_degree=0,
+            sh_degree=min(render_tab_state.max_sh_degree, self.cfg.sh_degree),
             near_plane=render_tab_state.near_plane,
             far_plane=render_tab_state.far_plane,
             radius_clip=render_tab_state.radius_clip,

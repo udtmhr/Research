@@ -316,11 +316,12 @@ def create_splats_with_optimizers(
     ]
 
     if feature_dim is None:
-        # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+        D = torch.logit(rgbs.clamp(min=1e-5, max=1.0-1e-5))
+        params.append(("D", torch.nn.Parameter(D), sh0_lr))
+        amplitudes = torch.zeros((N, 3, 3))
+        params.append(("amplitudes", torch.nn.Parameter(amplitudes), 0.0025))
+        sharpness = torch.zeros((N, 3))
+        params.append(("sharpness", torch.nn.Parameter(sharpness), 0.0025))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
@@ -644,6 +645,7 @@ class Runner:
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
+        step = kwargs.pop("step", 30000)
         if self.cfg.app_opt:
             colors = self.app_module(
                 features=self.splats["features"],
@@ -654,7 +656,27 @@ class Runner:
             colors = colors + self.splats["colors"]
             colors = torch.sigmoid(colors)
         else:
-            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+            D = self.splats["D"]
+            C_camera = camtoworlds.shape[0]
+            colors = D.unsqueeze(0).expand(C_camera, -1, -1)
+            
+            if step >= 2000:
+                view_dir = means[None, :, :] - camtoworlds[:, None, :3, 3]
+                view_dir = F.normalize(view_dir, dim=-1)
+                
+                alpha = self.splats["amplitudes"]
+                lambd = F.softplus(self.splats["sharpness"])
+                
+                specular = torch.zeros_like(colors)
+                for i in range(3):
+                    d_mu = view_dir[..., i]
+                    exp_term = torch.exp(lambd[:, i][None, :] * (d_mu - 1.0))
+                    specular += alpha[:, i, :][None, :, :] * exp_term[..., None]
+                
+                colors = colors + specular
+            
+            colors = torch.sigmoid(colors)
+            kwargs.pop("sh_degree", None)
 
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
@@ -884,6 +906,7 @@ class Runner:
                 width=width,
                 height=height,
                 sh_degree=sh_degree_to_use,
+                step=step,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
@@ -1054,8 +1077,9 @@ class Runner:
                     sh0 = rgb_to_sh(rgb)
                     shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
                 else:
-                    sh0 = self.splats["sh0"]
-                    shN = self.splats["shN"]
+                    rgb = torch.sigmoid(self.splats["D"]).unsqueeze(1)
+                    sh0 = rgb_to_sh(rgb)
+                    shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
 
                 means = self.splats["means"]
                 scales = self.splats["scales"]
