@@ -237,6 +237,17 @@ class Config:
     with_ut: bool = False
     with_eval3d: bool = False
 
+    # --- Observation Count-based opacity補正 ---
+    # 観測回数ベースのopacity補正を有効にする
+    obs_count_enabled: bool = True
+    # 寄与度の閾値 (tau_w): ピクセルへの寄与がこの値以上なら「観測」とみなす
+    # ※ CUDA変更なし版では radii > 0 で判定するため、この値は将来のCUDA拡張用
+    obs_count_tau_w: float = 0.001
+    # 観測回数の閾値 (tau_N): この回数以上観測されたGaussianの信頼度を1.0とする
+    obs_count_tau_n: int = 5
+    # 最小信頼度 (q_min): 一度も観測されていないGaussianでもこの割合のopacityは保持する
+    obs_count_q_min: float = 0.2
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -493,6 +504,13 @@ class Runner:
         else:
             assert_never(self.cfg.strategy)
 
+        # 観測回数バッファの初期化
+        # strategy_stateに格納することでdensify/split/prune時に自動で継承・削除される
+        if cfg.obs_count_enabled:
+            self.strategy_state["obs_count"] = torch.zeros(
+                len(self.splats["means"]), dtype=torch.int32, device=self.device
+            )
+
         # Compression Strategy
         self.compression_method = None
         if cfg.compression is not None:
@@ -643,6 +661,21 @@ class Runner:
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+
+        # 観測回数に基づくopacity補正: 少数viewからしか見えていないGaussianのopacityを下げる
+        if (
+            self.cfg.obs_count_enabled
+            and hasattr(self, "strategy_state")
+            and "obs_count" in self.strategy_state
+        ):
+            obs_count = self.strategy_state["obs_count"]
+            # q_i = clamp(N_i / tau_N, q_min, 1.0)
+            confidence = torch.clamp(
+                obs_count.float() / self.cfg.obs_count_tau_n,
+                min=self.cfg.obs_count_q_min,
+                max=1.0,
+            )
+            opacities = opacities * confidence
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
@@ -895,6 +928,26 @@ class Runner:
                 camera_idcs=data["camera_idx"].to(device),
                 exposure=exposure,
             )
+            # 観測回数の更新: 描画対象となったGaussianの観測回数を+1する
+            # 同一view内では重複加算されない（uniqueで一意なIDのみに加算）
+            if (
+                cfg.obs_count_enabled
+                and "obs_count" in self.strategy_state
+            ):
+                if cfg.packed:
+                    gs_ids = info["gaussian_ids"]
+                else:
+                    # radii > 0 のGaussianは描画に寄与したとみなす
+                    visible_mask = (info["radii"] > 0).all(dim=-1)  # [C, N]
+                    gs_ids = torch.where(visible_mask)[1]  # [nnz]
+                # 同じGaussianが複数カメラ/タイルで重複する場合があるのでuniqueを取る
+                unique_gs_ids = gs_ids.unique()
+                self.strategy_state["obs_count"].index_add_(
+                    0,
+                    unique_gs_ids,
+                    torch.ones_like(unique_gs_ids, dtype=torch.int32),
+                )
+
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
@@ -1007,6 +1060,15 @@ class Runner:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
                     self.writer.add_image("train/render", canvas, step)
+                # 観測回数の統計をTensorBoardに記録
+                if cfg.obs_count_enabled and "obs_count" in self.strategy_state:
+                    obs = self.strategy_state["obs_count"].float()
+                    self.writer.add_scalar("train/obs_count_mean", obs.mean().item(), step)
+                    self.writer.add_scalar("train/obs_count_min", obs.min().item(), step)
+                    self.writer.add_scalar("train/obs_count_max", obs.max().item(), step)
+                    # 信頼度が1.0に達したGaussianの割合
+                    fully_observed_ratio = (obs >= cfg.obs_count_tau_n).float().mean().item()
+                    self.writer.add_scalar("train/obs_fully_observed_ratio", fully_observed_ratio, step)
                 self.writer.flush()
 
             # save checkpoint before updating the model
@@ -1024,6 +1086,9 @@ class Runner:
                 ) as f:
                     json.dump(stats, f)
                 data = {"step": step, "splats": self.splats.state_dict()}
+                # 観測回数をチェックポイントに保存（学習再開時に復元可能にする）
+                if cfg.obs_count_enabled and "obs_count" in self.strategy_state:
+                    data["obs_count"] = self.strategy_state["obs_count"].cpu()
                 if cfg.pose_opt:
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
