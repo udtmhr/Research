@@ -1059,7 +1059,7 @@ class Runner:
                 if cfg.tb_save_image:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
-                    self.writer.add_image("train/render", canvas, step)
+                    self.writer.add_image("train/render", canvas, step, dataformats="HWC")
                 # 観測回数の統計をTensorBoardに記録
                 if cfg.obs_count_enabled and "obs_count" in self.strategy_state:
                     obs = self.strategy_state["obs_count"].float()

@@ -226,6 +226,45 @@ class Config:
     # Weight for depth loss
     depth_lambda: float = 1e-2
 
+    # Enable texture-warp view consistency loss. COLMAP + pinhole only in this trainer.
+    use_warp_loss: bool = False
+    # Weight for texture-warp view consistency loss
+    lambda_warp: float = 0.05
+    # Number of nearby training cameras used as warp references
+    warp_num_neighbors: int = 3
+    # Viewing-direction similarity cutoff in degrees
+    warp_theta_max_deg: float = 30.0
+    # Depth consistency temperature
+    warp_tau_depth: float = 0.01
+    # First iteration where warp loss is active
+    warp_start_iter: int = 7000
+    # Compute warp loss every N iterations
+    warp_interval: int = 10
+    # Number of manual virtual keyframes sampled per active iteration
+    warp_num_virtual_views: int = 1
+    # Minimum accumulated visibility confidence for warp supervision
+    warp_min_gamma: float = 0.05
+    # Downsample factor for warp renders and image sampling
+    warp_downsample: int = 1
+    # Use keyframes saved from the viewer as virtual camera poses.
+    warp_manual_camera_path: Optional[str] = "camera_paths/virtual.json"
+    # Scale ratio used by nerfview when saving/loading camera path JSON.
+    warp_manual_camera_scale_ratio: float = 10.0
+    # Error if no saved keyframes are available when warp_manual_camera_path is set.
+    warp_require_manual_keyframes: bool = True
+    # Save camera pose visualization/debug JSON for active warp iterations
+    warp_save_camera_debug: bool = True
+    # Save camera pose debug every N warp-active iterations
+    warp_camera_debug_interval: int = 100
+    # Show the latest warp virtual/reference camera set in the viewer
+    warp_viewer_debug: bool = True
+    # Use offline precomputed virtual C_ref supervision instead of online warping
+    use_precomputed_virtual_refs: bool = False
+    # Directory containing ref_*.npz, relative to data_dir or result_dir
+    virtual_ref_dir: str = "virtual_refs"
+    # Advance the selected precomputed virtual reference every N steps
+    virtual_ref_interval: int = 10
+
     # Dump information to tensorboard every this steps
     tb_every: int = 100
     # Save training images to tensorboard
@@ -243,6 +282,11 @@ class Config:
         self.ply_steps = [int(i * factor) for i in self.ply_steps]
         self.max_steps = int(self.max_steps * factor)
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
+        self.warp_start_iter = int(self.warp_start_iter * factor)
+        self.warp_interval = max(1, int(self.warp_interval * factor))
+        self.warp_camera_debug_interval = max(
+            1, int(self.warp_camera_debug_interval * factor)
+        )
 
         strategy = self.strategy
         if isinstance(strategy, DefaultStrategy):
@@ -324,7 +368,7 @@ def create_splats_with_optimizers(
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
     else:
         # features will be used for appearance and view-dependent shading
-        features = torch.rand(N, feature_dim)  # [N, feature_dim]
+        features = torch.rand(N, feature_dim)  # [N,     features_dc im]
         params.append(("features", torch.nn.Parameter(features), sh0_lr))
         colors = torch.logit(rgbs)  # [N, 3]
         params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
@@ -432,6 +476,47 @@ class Runner:
                 load_depths=cfg.depth_loss,
             )
             self.valset = Dataset(self.parser, split="val")
+        self.warp_cache = None
+        self._saved_warp_reference_sets = set()
+        if cfg.use_warp_loss:
+            if cfg.data_type != "colmap":
+                raise ValueError("Warp loss is only implemented for data_type='colmap'.")
+            if cfg.camera_model != "pinhole":
+                raise ValueError("Warp loss v1 requires camera_model='pinhole'.")
+            if cfg.batch_size != 1:
+                raise ValueError("Warp loss v1 requires batch_size=1.")
+            if cfg.patch_size is not None:
+                raise ValueError(
+                    "Warp loss v1 requires full-image training; patch_size must be None."
+                )
+            if cfg.warp_num_neighbors <= 0:
+                raise ValueError("warp_num_neighbors must be positive.")
+            if cfg.warp_interval <= 0:
+                raise ValueError("warp_interval must be positive.")
+            if cfg.warp_num_virtual_views <= 0:
+                raise ValueError("warp_num_virtual_views must be positive.")
+            if cfg.warp_downsample <= 0:
+                raise ValueError("warp_downsample must be positive.")
+            if cfg.warp_manual_camera_scale_ratio <= 0:
+                raise ValueError("warp_manual_camera_scale_ratio must be positive.")
+            if cfg.warp_camera_debug_interval <= 0:
+                raise ValueError("warp_camera_debug_interval must be positive.")
+            if cfg.virtual_ref_interval <= 0:
+                raise ValueError("virtual_ref_interval must be positive.")
+            if cfg.warp_tau_depth <= 0:
+                raise ValueError("warp_tau_depth must be positive.")
+            if not (0.0 < cfg.warp_theta_max_deg < 180.0):
+                raise ValueError("warp_theta_max_deg must be in (0, 180).")
+            if cfg.use_precomputed_virtual_refs:
+                self.precomputed_virtual_refs = self._load_precomputed_virtual_refs()
+                self.manual_warp_cameras = None
+            else:
+                self.precomputed_virtual_refs = None
+                self.warp_cache = self._build_warp_cache()
+                self.manual_warp_cameras = self._load_manual_warp_cameras()
+        else:
+            self.precomputed_virtual_refs = None
+            self.manual_warp_cameras = None
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -604,6 +689,13 @@ class Runner:
                 output_dir=Path(cfg.result_dir),
                 mode="training",
             )
+            self._warp_viewer_handles = []
+            if (
+                cfg.use_warp_loss
+                and cfg.warp_viewer_debug
+                and not cfg.use_precomputed_virtual_refs
+            ):
+                self._init_warp_viewer_debug()
 
         # Track if Gaussians are frozen (for controller distillation)
         self._gaussians_frozen = False
@@ -760,6 +852,977 @@ class Runner:
             )
 
         return render_colors, render_alphas, info
+
+    def _build_warp_cache(self) -> Dict[str, object]:
+        train_indices = np.asarray(self.trainset.indices)
+        camtoworlds = torch.from_numpy(self.parser.camtoworlds[train_indices]).float()
+        Ks = []
+        heights = []
+        widths = []
+        camera_idcs = []
+        image_names = []
+        ref_images = []
+        ref_depths = []
+        for dataset_idx, parser_idx in enumerate(train_indices):
+            camera_id = self.parser.camera_ids[int(parser_idx)]
+            width, height = self.parser.imsize_dict[camera_id]
+            Ks.append(torch.from_numpy(self.parser.Ks_dict[camera_id]).float())
+            widths.append(width)
+            heights.append(height)
+            camera_idcs.append(self.parser.camera_indices[int(parser_idx)])
+            image_names.append(Path(self.parser.image_names[int(parser_idx)]).name)
+            target_height, target_width = self._warp_size(height, width)
+            ref_images.append(
+                self._load_single_warp_reference_image(
+                    dataset_idx, target_height, target_width
+                )
+            )
+            ref_depths.append(
+                self._load_single_warp_reference_depth(
+                    dataset_idx, target_height, target_width
+                )
+            )
+
+        return {
+            "camtoworlds": camtoworlds,
+            "centers": camtoworlds[:, :3, 3],
+            "Ks": torch.stack(Ks, dim=0),
+            "heights": torch.tensor(heights, dtype=torch.long),
+            "widths": torch.tensor(widths, dtype=torch.long),
+            "camera_idcs": torch.tensor(camera_idcs, dtype=torch.long),
+            "image_names": image_names,
+            "ref_images": ref_images,
+            "ref_depths": ref_depths,
+        }
+
+    def _warp_size(self, height: int, width: int) -> Tuple[int, int]:
+        downsample = max(1, self.cfg.warp_downsample)
+        return max(2, height // downsample), max(2, width // downsample)
+
+    def _scale_Ks(
+        self,
+        Ks: Tensor,
+        heights: Tensor,
+        widths: Tensor,
+        target_height: int,
+        target_width: int,
+    ) -> Tensor:
+        scaled_Ks = Ks.clone()
+        sx = target_width / widths.to(Ks).float()
+        sy = target_height / heights.to(Ks).float()
+        scaled_Ks[:, 0, :] *= sx[:, None]
+        scaled_Ks[:, 1, :] *= sy[:, None]
+        return scaled_Ks
+
+    def _select_warp_neighbors(
+        self,
+        exclude_image_idx: Optional[int],
+        camtoworld: Tensor,
+        height: int,
+        width: int,
+    ) -> Tensor:
+        assert self.warp_cache is not None
+        target_height, target_width = self._warp_size(height, width)
+        cache = self.warp_cache
+        cache_heights = cache["heights"]
+        cache_widths = cache["widths"]
+        cache_heights_ds = torch.tensor(
+            [
+                self._warp_size(int(h), int(w))[0]
+                for h, w in zip(cache_heights, cache_widths)
+            ],
+            dtype=torch.long,
+        )
+        cache_widths_ds = torch.tensor(
+            [
+                self._warp_size(int(h), int(w))[1]
+                for h, w in zip(cache_heights, cache_widths)
+            ],
+            dtype=torch.long,
+        )
+        same_size = (cache_heights_ds == target_height) & (
+            cache_widths_ds == target_width
+        )
+        valid = same_size
+        if exclude_image_idx is not None:
+            valid = valid & (torch.arange(len(cache_heights)) != exclude_image_idx)
+        candidates = torch.nonzero(valid, as_tuple=False).flatten()
+        if candidates.numel() == 0:
+            return torch.empty(0, dtype=torch.long, device=camtoworld.device)
+
+        centers = cache["centers"].to(camtoworld.device)
+        current_center = camtoworld[0, :3, 3].detach()
+        distances = torch.linalg.norm(
+            centers[candidates.to(camtoworld.device)] - current_center, dim=-1
+        )
+        order = torch.argsort(distances)
+        selected = candidates[order.cpu()[: self.cfg.warp_num_neighbors]]
+        return selected.to(camtoworld.device)
+
+    def _load_single_warp_reference_image(
+        self, dataset_idx: int, target_height: int, target_width: int
+    ) -> Tensor:
+        ref_data = self.trainset[int(dataset_idx)]
+        image = ref_data["image"].float()[..., :3] / 255.0
+        image = image.permute(2, 0, 1).unsqueeze(0)
+        image = F.interpolate(
+            image,
+            size=(target_height, target_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return image.squeeze(0).permute(1, 2, 0).contiguous()
+
+    def _get_cached_warp_reference_images(
+        self, neighbor_idcs: Tensor, device: torch.device
+    ) -> Tensor:
+        assert self.warp_cache is not None
+        ref_images = self.warp_cache["ref_images"]
+        images = [
+            ref_images[int(idx)].to(device)
+            for idx in neighbor_idcs.detach().cpu().tolist()
+        ]
+        return torch.stack(images, dim=0)
+
+    def _write_warp_reference_images(
+        self,
+        virtual_camera_source: str,
+        neighbor_idcs: Tensor,
+        ref_images: Tensor,
+    ) -> None:
+        assert self.warp_cache is not None
+        neighbor_indices = tuple(
+            int(idx) for idx in neighbor_idcs.detach().cpu().tolist()
+        )
+        save_key = (virtual_camera_source, neighbor_indices)
+        if save_key in self._saved_warp_reference_sets:
+            return
+
+        safe_source = "".join(
+            c if c.isalnum() or c in {"-", "_"} else "_" for c in virtual_camera_source
+        )
+        save_dir = Path(self.cfg.result_dir) / "warp_reference_images" / safe_source
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        image_names = self.warp_cache["image_names"]
+        manifest = {
+            "virtual_camera_source": virtual_camera_source,
+            "neighbor_image_indices": list(neighbor_indices),
+            "references": [],
+        }
+        for ref_order, dataset_idx in enumerate(neighbor_indices):
+            source_name = image_names[dataset_idx]
+            source_stem = Path(source_name).stem
+            filename = f"ref_{ref_order:02d}_idx_{dataset_idx:06d}_{source_stem}.png"
+            image = (
+                ref_images[ref_order].detach().clamp(0.0, 1.0).mul(255.0)
+                .byte()
+                .cpu()
+                .numpy()
+            )
+            imageio.imwrite(save_dir / filename, image)
+            manifest["references"].append(
+                {
+                    "order": ref_order,
+                    "dataset_index": dataset_idx,
+                    "source_image": source_name,
+                    "saved_image": filename,
+                }
+            )
+
+        with open(save_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
+        self._saved_warp_reference_sets.add(save_key)
+
+    def _resolve_warp_depth_path(self, dataset_idx: int) -> Path:
+        parser_idx = int(self.trainset.indices[dataset_idx])
+        image_name = Path(self.parser.image_names[parser_idx])
+        image_path = Path(self.parser.image_paths[parser_idx])
+        depth_dir = Path(self.cfg.data_dir) / "depths"
+        candidates = [
+            depth_dir / image_name.name,
+            depth_dir / image_path.name,
+        ]
+        for stem in {image_name.stem, image_path.stem}:
+            for suffix in [".npy", ".npz", ".png", ".jpg", ".jpeg", ".tif", ".tiff"]:
+                candidates.append(depth_dir / f"{stem}{suffix}")
+        for path in candidates:
+            if path.exists():
+                return path
+        raise FileNotFoundError(
+            f"No depth map found for {image_name.name} under {depth_dir}"
+        )
+
+    def _read_warp_depth(self, path: Path) -> np.ndarray:
+        if path.suffix.lower() == ".npy":
+            depth = np.load(path)
+        elif path.suffix.lower() == ".npz":
+            data = np.load(path)
+            key = "depth" if "depth" in data else data.files[0]
+            depth = data[key]
+        else:
+            depth = imageio.imread(path)
+            if depth.ndim == 3:
+                depth = depth[..., 0]
+            if np.issubdtype(depth.dtype, np.integer):
+                depth = depth.astype(np.float32) / np.iinfo(depth.dtype).max
+        return np.asarray(depth, dtype=np.float32)
+
+    def _load_single_warp_reference_depth(
+        self, dataset_idx: int, target_height: int, target_width: int
+    ) -> Tensor:
+        parser_idx = int(self.trainset.indices[int(dataset_idx)])
+        camera_id = self.parser.camera_ids[parser_idx]
+        depth = self._read_warp_depth(self._resolve_warp_depth_path(int(dataset_idx)))
+        params = self.parser.params_dict[camera_id]
+        if len(params) > 0:
+            import cv2
+
+            mapx, mapy = (
+                self.parser.mapx_dict[camera_id],
+                self.parser.mapy_dict[camera_id],
+            )
+            depth = cv2.remap(depth, mapx, mapy, cv2.INTER_LINEAR)
+            x, y, w, h = self.parser.roi_undist_dict[camera_id]
+            depth = depth[y : y + h, x : x + w]
+        depth_tensor = torch.from_numpy(depth).float()[None, None]
+        depth_tensor = F.interpolate(
+            depth_tensor,
+            size=(target_height, target_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return depth_tensor.squeeze(0).permute(1, 2, 0).contiguous()
+
+    def _get_cached_warp_reference_depths(
+        self, neighbor_idcs: Tensor, device: torch.device
+    ) -> Tensor:
+        assert self.warp_cache is not None
+        ref_depths = self.warp_cache["ref_depths"]
+        depths = [
+            ref_depths[int(idx)].to(device)
+            for idx in neighbor_idcs.detach().cpu().tolist()
+        ]
+        return torch.stack(depths, dim=0)
+
+    def _load_manual_warp_cameras(self) -> Optional[Dict[str, Tensor]]:
+        if self.cfg.warp_manual_camera_path is None:
+            return None
+
+        path_arg = self.cfg.warp_manual_camera_path
+        if path_arg in {"latest", "auto"}:
+            camera_path_dir = Path(self.cfg.result_dir) / "camera_paths"
+            candidates = sorted(camera_path_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
+            if len(candidates) == 0:
+                raise FileNotFoundError(f"No camera path JSON found in {camera_path_dir}")
+            path = candidates[-1]
+        else:
+            path = Path(path_arg)
+            if not path.is_absolute():
+                data_path = Path(self.cfg.data_dir) / path
+                result_path = Path(self.cfg.result_dir) / path
+                result_camera_path = Path(self.cfg.result_dir) / "camera_paths" / path
+                if data_path.exists():
+                    path = data_path
+                elif result_path.exists():
+                    path = result_path
+                else:
+                    path = result_camera_path
+        if not path.exists():
+            raise FileNotFoundError(f"Manual warp camera path does not exist: {path}")
+
+        with open(path, "r") as f:
+            data = json.load(f)
+        keyframes = data.get("keyframes", [])
+        if len(keyframes) == 0:
+            if self.cfg.warp_require_manual_keyframes:
+                raise ValueError(f"No keyframes found in manual warp camera path: {path}")
+            return None
+
+        camtoworlds = []
+        fovs = []
+        aspects = []
+        opencv_from_viewer = np.eye(4, dtype=np.float32)
+        opencv_from_viewer[1, 1] = -1.0
+        opencv_from_viewer[2, 2] = -1.0
+        for keyframe in keyframes:
+            if "matrix" not in keyframe:
+                raise ValueError(f"Keyframe is missing matrix in {path}")
+            saved_camtoworld = np.array(keyframe["matrix"], dtype=np.float32).reshape(4, 4)
+            # nerfview saves keyframes as:
+            #   matrix = [viewer_rotation @ Rx(pi), viewer_position / scale_ratio]
+            # The training viewer render path uses the original viewer pose, so invert
+            # that save-time convention and use only the manually added keyframes.
+            camtoworld = saved_camtoworld @ opencv_from_viewer
+            camtoworld[:3, 3] = (
+                saved_camtoworld[:3, 3] * self.cfg.warp_manual_camera_scale_ratio
+            )
+            camtoworlds.append(torch.from_numpy(camtoworld))
+            fovs.append(float(keyframe.get("fov", data.get("default_fov", 60.0))))
+            aspects.append(float(keyframe.get("aspect", 1.0)))
+
+        print(f"[Warp] Loaded {len(camtoworlds)} manual virtual cameras from {path}")
+        return {
+            "camtoworlds": torch.stack(camtoworlds, dim=0),
+            "fovs": torch.tensor(fovs, dtype=torch.float32),
+            "aspects": torch.tensor(aspects, dtype=torch.float32),
+        }
+
+    def _load_precomputed_virtual_refs(self) -> List[Dict[str, Tensor]]:
+        ref_dir = Path(self.cfg.virtual_ref_dir)
+        if not ref_dir.is_absolute():
+            data_ref_dir = Path(self.cfg.data_dir) / ref_dir
+            result_ref_dir = Path(self.cfg.result_dir) / ref_dir
+            ref_dir = data_ref_dir if data_ref_dir.exists() else result_ref_dir
+        if not ref_dir.exists():
+            raise FileNotFoundError(f"Precomputed virtual ref dir does not exist: {ref_dir}")
+
+        ref_paths = sorted(ref_dir.glob("ref_*.npz"))
+        ref_paths = [p for p in ref_paths if not p.name.endswith("_debug.npz")]
+        if len(ref_paths) == 0:
+            raise FileNotFoundError(f"No ref_*.npz found in {ref_dir}")
+
+        refs = []
+        for path in ref_paths:
+            data = np.load(path)
+            required = ["C_ref", "M_ref", "weight_sum", "depth_virtual", "camtoworld", "K"]
+            missing = [key for key in required if key not in data]
+            if missing:
+                raise ValueError(f"{path} is missing keys: {missing}")
+            refs.append(
+                {
+                    "C_ref": torch.from_numpy(data["C_ref"].astype(np.float32)),
+                    "M_ref": torch.from_numpy(data["M_ref"].astype(bool)),
+                    "weight_sum": torch.from_numpy(data["weight_sum"].astype(np.float32)),
+                    "depth_virtual": torch.from_numpy(data["depth_virtual"].astype(np.float32)),
+                    "camtoworld": torch.from_numpy(data["camtoworld"].astype(np.float32)),
+                    "K": torch.from_numpy(data["K"].astype(np.float32)),
+                    "source_keyframe_index": torch.tensor(
+                        int(data["source_keyframe_index"])
+                        if "source_keyframe_index" in data
+                        else len(refs),
+                        dtype=torch.long,
+                    ),
+                }
+            )
+        print(f"[Warp] Loaded {len(refs)} precomputed virtual refs from {ref_dir}")
+        return refs
+
+    def _make_K_from_fov(
+        self,
+        fov_deg: Tensor,
+        aspect: Tensor,
+        height: int,
+        width: int,
+        device: torch.device,
+    ) -> Tensor:
+        fov_rad = torch.deg2rad(fov_deg.to(device))
+        fy = (0.5 * height) / torch.tan(0.5 * fov_rad).clamp(min=1e-6)
+        fx = fy
+        K = torch.eye(3, device=device).unsqueeze(0)
+        K[:, 0, 0] = fx
+        K[:, 1, 1] = fy
+        K[:, 0, 2] = width * 0.5
+        K[:, 1, 2] = height * 0.5
+        return K
+
+    def _get_virtual_camera(
+        self,
+        step: int,
+        current_camtoworld: Tensor,
+        current_K: Tensor,
+        source_height: int,
+        source_width: int,
+        target_height: int,
+        target_width: int,
+        virtual_camera_index: Optional[int] = None,
+    ) -> Tuple[Tensor, Tensor, str]:
+        if self.manual_warp_cameras is None:
+            raise RuntimeError(
+                "Manual warp cameras are not loaded. "
+                "Set --warp-manual-camera-path to a viewer keyframe JSON."
+            )
+
+        camtoworlds = self.manual_warp_cameras["camtoworlds"]
+        if virtual_camera_index is None:
+            index = (step - self.cfg.warp_start_iter) // self.cfg.warp_interval
+            index = int(index % len(camtoworlds))
+        else:
+            index = int(virtual_camera_index % len(camtoworlds))
+        virtual_c2w = camtoworlds[index : index + 1].to(current_camtoworld.device)
+        K_virtual = self._make_K_from_fov(
+            self.manual_warp_cameras["fovs"][index : index + 1],
+            self.manual_warp_cameras["aspects"][index : index + 1],
+            target_height,
+            target_width,
+            current_camtoworld.device,
+        )
+        return virtual_c2w, K_virtual, f"manual_keyframe_{index}"
+
+    def _backproject_depth(self, depths: Tensor, camtoworld: Tensor, K: Tensor) -> Tensor:
+        height, width = depths.shape[:2]
+        ys, xs = torch.meshgrid(
+            torch.arange(height, device=depths.device, dtype=depths.dtype),
+            torch.arange(width, device=depths.device, dtype=depths.dtype),
+            indexing="ij",
+        )
+        z = depths[..., 0]
+        x = (xs - K[0, 0, 2]) / K[0, 0, 0] * z
+        y = (ys - K[0, 1, 2]) / K[0, 1, 1] * z
+        points_cam = torch.stack([x, y, z], dim=-1)
+        points_world = (
+            torch.matmul(camtoworld[0, :3, :3], points_cam.reshape(-1, 3).T)
+            + camtoworld[0, :3, 3:4]
+        ).T
+        return points_world.reshape(height, width, 3).detach()
+
+    def _draw_point(
+        self, canvas: np.ndarray, point: np.ndarray, color: Tuple[float, float, float], radius: int
+    ) -> None:
+        height, width = canvas.shape[:2]
+        x, y = int(round(point[0])), int(round(point[1]))
+        x0, x1 = max(0, x - radius), min(width, x + radius + 1)
+        y0, y1 = max(0, y - radius), min(height, y + radius + 1)
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        mask = (xx - x) ** 2 + (yy - y) ** 2 <= radius**2
+        canvas[y0:y1, x0:x1][mask] = color
+
+    def _draw_line(
+        self,
+        canvas: np.ndarray,
+        start: np.ndarray,
+        end: np.ndarray,
+        color: Tuple[float, float, float],
+        steps: int = 64,
+    ) -> None:
+        for t in np.linspace(0.0, 1.0, steps):
+            point = start * (1.0 - t) + end * t
+            self._draw_point(canvas, point, color, radius=1)
+
+    def _rotation_matrix_to_wxyz(self, rotation: np.ndarray) -> np.ndarray:
+        trace = float(np.trace(rotation))
+        if trace > 0.0:
+            s = math.sqrt(trace + 1.0) * 2.0
+            qw = 0.25 * s
+            qx = (rotation[2, 1] - rotation[1, 2]) / s
+            qy = (rotation[0, 2] - rotation[2, 0]) / s
+            qz = (rotation[1, 0] - rotation[0, 1]) / s
+        else:
+            diag = np.diag(rotation)
+            if diag[0] > diag[1] and diag[0] > diag[2]:
+                s = math.sqrt(1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]) * 2.0
+                qw = (rotation[2, 1] - rotation[1, 2]) / s
+                qx = 0.25 * s
+                qy = (rotation[0, 1] + rotation[1, 0]) / s
+                qz = (rotation[0, 2] + rotation[2, 0]) / s
+            elif diag[1] > diag[2]:
+                s = math.sqrt(1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]) * 2.0
+                qw = (rotation[0, 2] - rotation[2, 0]) / s
+                qx = (rotation[0, 1] + rotation[1, 0]) / s
+                qy = 0.25 * s
+                qz = (rotation[1, 2] + rotation[2, 1]) / s
+            else:
+                s = math.sqrt(1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]) * 2.0
+                qw = (rotation[1, 0] - rotation[0, 1]) / s
+                qx = (rotation[0, 2] + rotation[2, 0]) / s
+                qy = (rotation[1, 2] + rotation[2, 1]) / s
+                qz = 0.25 * s
+        quat = np.array([qw, qx, qy, qz], dtype=np.float64)
+        return quat / np.linalg.norm(quat)
+
+    def _camera_fov_aspect(self, K: Tensor, height: int, width: int) -> Tuple[float, float]:
+        fy = float(K[1, 1].detach().cpu())
+        fov = 2.0 * math.atan(height / (2.0 * max(fy, 1e-6)))
+        return fov, width / height
+
+    def _init_warp_viewer_debug(self) -> None:
+        if self.warp_cache is None:
+            return
+        centers = self.warp_cache["centers"].detach().cpu().numpy()
+        colors = np.full((len(centers), 3), 170, dtype=np.uint8)
+        self.server.scene.add_point_cloud(
+            "/warp_cameras/all_training_centers",
+            points=centers,
+            colors=colors,
+            point_size=max(0.002 * self.scene_scale, 0.001),
+            point_shape="circle",
+        )
+
+    def _update_warp_viewer_cameras(
+        self,
+        step: int,
+        current_c2w: Tensor,
+        virtual_c2w: Tensor,
+        ref_c2ws: Tensor,
+        K_virtual: Tensor,
+        ref_Ks: Tensor,
+        virtual_image: Tensor,
+        ref_images: Tensor,
+        height: int,
+        width: int,
+    ) -> None:
+        if self.cfg.disable_viewer or not self.cfg.warp_viewer_debug:
+            return
+        if not hasattr(self, "server"):
+            return
+        self.server.scene.remove_by_name("/warp_cameras/latest")
+        self._warp_viewer_handles = []
+        scale = max(0.08 * self.scene_scale, 0.02)
+
+        def add_frustum(
+            name: str,
+            c2w: Tensor,
+            K: Tensor,
+            color: Tuple[int, int, int],
+            image: Optional[Tensor],
+        ) -> None:
+            c2w_np = c2w.detach().cpu().numpy()
+            fov, aspect = self._camera_fov_aspect(K, height, width)
+            image_np = None
+            if image is not None:
+                image_np = (
+                    image.detach().clamp(0.0, 1.0).cpu().numpy() * 255
+                ).astype(np.uint8)
+            self._warp_viewer_handles.append(
+                self.server.scene.add_camera_frustum(
+                    name,
+                    fov=fov,
+                    aspect=aspect,
+                    scale=scale,
+                    line_width=2.0,
+                    color=color,
+                    image=image_np,
+                    wxyz=self._rotation_matrix_to_wxyz(c2w_np[:3, :3]),
+                    position=c2w_np[:3, 3],
+                )
+            )
+
+        add_frustum(
+            f"/warp_cameras/latest/current_step_{step}",
+            current_c2w[0],
+            K_virtual[0],
+            (255, 140, 0),
+            None,
+        )
+        add_frustum(
+            f"/warp_cameras/latest/virtual_step_{step}",
+            virtual_c2w[0],
+            K_virtual[0],
+            (255, 0, 0),
+            virtual_image,
+        )
+        for i in range(ref_c2ws.shape[0]):
+            add_frustum(
+                f"/warp_cameras/latest/reference_{i}_step_{step}",
+                ref_c2ws[i],
+                ref_Ks[i],
+                (40, 90, 255),
+                ref_images[i],
+            )
+
+    def _make_warp_camera_viz(
+        self,
+        current_c2w: Tensor,
+        virtual_c2w: Tensor,
+        ref_c2ws: Tensor,
+        neighbor_idcs: Tensor,
+    ) -> Tensor:
+        assert self.warp_cache is not None
+        canvas_size = 512
+        margin = 32
+        canvas = np.ones((canvas_size, canvas_size, 3), dtype=np.float32)
+
+        all_c2ws = self.warp_cache["camtoworlds"].detach().cpu()
+        all_centers = all_c2ws[:, :3, 3].numpy()
+        current_center = current_c2w[0, :3, 3].detach().cpu().numpy()
+        virtual_center = virtual_c2w[0, :3, 3].detach().cpu().numpy()
+        ref_centers = ref_c2ws[:, :3, 3].detach().cpu().numpy()
+        centers_for_axes = np.concatenate(
+            [all_centers, current_center[None], virtual_center[None], ref_centers],
+            axis=0,
+        )
+        axes = np.argsort(np.var(centers_for_axes, axis=0))[-2:]
+        xy = centers_for_axes[:, axes]
+        xy_min = xy.min(axis=0)
+        xy_max = xy.max(axis=0)
+        scale = (canvas_size - margin * 2) / max(float((xy_max - xy_min).max()), 1e-6)
+
+        def project(points: np.ndarray) -> np.ndarray:
+            projected = (points[:, axes] - xy_min) * scale + margin
+            projected[:, 1] = canvas_size - projected[:, 1]
+            return projected
+
+        def draw_cameras(c2ws: np.ndarray, color: Tuple[float, float, float], radius: int) -> None:
+            centers = project(c2ws[:, :3, 3])
+            forwards = c2ws[:, :3, 2]
+            forward_points = project(c2ws[:, :3, 3] + forwards * (0.04 / scale) * canvas_size)
+            for center, forward_point in zip(centers, forward_points):
+                self._draw_point(canvas, center, color, radius)
+                self._draw_line(canvas, center, forward_point, color)
+
+        draw_cameras(all_c2ws.numpy(), (0.70, 0.70, 0.70), 2)
+        draw_cameras(ref_c2ws.detach().cpu().numpy(), (0.10, 0.35, 1.00), 5)
+        draw_cameras(current_c2w.detach().cpu().numpy(), (1.00, 0.55, 0.05), 6)
+        draw_cameras(virtual_c2w.detach().cpu().numpy(), (1.00, 0.05, 0.05), 6)
+        return torch.from_numpy(canvas)
+
+    def _make_warp_camera_debug(
+        self,
+        step: int,
+        current_image_idx: int,
+        virtual_camera_source: str,
+        neighbor_idcs: Tensor,
+        current_c2w: Tensor,
+        virtual_c2w: Tensor,
+        ref_c2ws: Tensor,
+        K_virtual: Tensor,
+        ref_Ks: Tensor,
+    ) -> Dict[str, object]:
+        return {
+            "step": step,
+            "current_image_idx": current_image_idx,
+            "virtual_camera_source": virtual_camera_source,
+            "neighbor_image_indices": neighbor_idcs.detach().cpu().tolist(),
+            "current_camtoworld": current_c2w[0].detach().cpu().tolist(),
+            "virtual_camtoworld": virtual_c2w[0].detach().cpu().tolist(),
+            "reference_camtoworlds": ref_c2ws.detach().cpu().tolist(),
+            "virtual_K": K_virtual[0].detach().cpu().tolist(),
+            "reference_Ks": ref_Ks.detach().cpu().tolist(),
+            "color_legend": {
+                "all_training_cameras": "gray",
+                "selected_reference_cameras": "blue",
+                "current_training_camera": "orange",
+                "virtual_camera": "red",
+            },
+        }
+
+    def _compute_single_warp_loss(
+        self,
+        step: int,
+        current_camtoworld: Tensor,
+        current_K: Tensor,
+        current_image_id: Tensor,
+        sh_degree: int,
+        height: int,
+        width: int,
+        virtual_camera_index: Optional[int] = None,
+    ) -> Tuple[Tensor, Optional[Dict[str, object]]]:
+        assert self.warp_cache is not None
+        device = current_camtoworld.device
+        current_idx = int(current_image_id.item())
+        target_height, target_width = self._warp_size(height, width)
+        virtual_c2w, K_virtual, virtual_camera_source = self._get_virtual_camera(
+            step,
+            current_camtoworld,
+            current_K,
+            height,
+            width,
+            target_height,
+            target_width,
+            virtual_camera_index,
+        )
+        neighbor_idcs = self._select_warp_neighbors(
+            None, virtual_c2w, height, width
+        )
+        if neighbor_idcs.numel() == 0:
+            return torch.zeros((), device=device), None
+
+        virtual_renders, _, _ = self.rasterize_splats(
+            camtoworlds=virtual_c2w,
+            Ks=K_virtual,
+            width=target_width,
+            height=target_height,
+            sh_degree=sh_degree,
+            near_plane=self.cfg.near_plane,
+            far_plane=self.cfg.far_plane,
+            image_ids=current_image_id,
+            render_mode="RGB+ED",
+            frame_idcs=None,
+            camera_idcs=None,
+            exposure=None,
+        )
+        virtual_colors = virtual_renders[..., :3]
+        virtual_depths = virtual_renders[..., 3:4].detach()
+        points_world = self._backproject_depth(
+            virtual_depths[0], virtual_c2w, K_virtual
+        )
+        valid_virtual_depth = torch.isfinite(virtual_depths[0]) & (
+            virtual_depths[0] > 0
+        )
+
+        cache = self.warp_cache
+        neighbor_cpu = neighbor_idcs.detach().cpu()
+        ref_c2ws = cache["camtoworlds"][neighbor_cpu].to(device)
+        ref_heights = cache["heights"][neighbor_cpu].to(device)
+        ref_widths = cache["widths"][neighbor_cpu].to(device)
+        ref_Ks = self._scale_Ks(
+            cache["Ks"][neighbor_cpu].to(device),
+            ref_heights,
+            ref_widths,
+            target_height,
+            target_width,
+        )
+        if self.cfg.pose_noise:
+            ref_c2ws = self.pose_perturb(ref_c2ws, neighbor_idcs)
+        if self.cfg.pose_opt:
+            ref_c2ws = self.pose_adjust(ref_c2ws, neighbor_idcs)
+
+        ref_depths = self._get_cached_warp_reference_depths(neighbor_idcs, device)
+        ref_images = self._get_cached_warp_reference_images(neighbor_idcs, device)
+        self._write_warp_reference_images(
+            virtual_camera_source, neighbor_idcs, ref_images
+        )
+        self._update_warp_viewer_cameras(
+            step,
+            current_camtoworld,
+            virtual_c2w,
+            ref_c2ws,
+            K_virtual,
+            ref_Ks,
+            virtual_colors[0].detach(),
+            ref_images,
+            target_height,
+            target_width,
+        )
+
+        num_refs = int(neighbor_idcs.numel())
+        points_flat = points_world.reshape(-1, 3)
+        world_to_refs = torch.linalg.inv(ref_c2ws)
+        points_cam = (
+            torch.matmul(world_to_refs[:, :3, :3], points_flat.T)
+            + world_to_refs[:, :3, 3:4]
+        ).transpose(1, 2)
+        z_ref = points_cam[..., 2].reshape(num_refs, target_height, target_width, 1)
+        z_safe = z_ref.clamp(min=1e-6)
+        u_ref = (
+            ref_Ks[:, None, None, 0, 0]
+            * points_cam[..., 0].reshape(num_refs, target_height, target_width)
+            / z_safe[..., 0]
+            + ref_Ks[:, None, None, 0, 2]
+        )
+        v_ref = (
+            ref_Ks[:, None, None, 1, 1]
+            * points_cam[..., 1].reshape(num_refs, target_height, target_width)
+            / z_safe[..., 0]
+            + ref_Ks[:, None, None, 1, 2]
+        )
+        inside = (
+            (z_ref[..., 0] > 1e-6)
+            & valid_virtual_depth[..., 0][None]
+            & (u_ref >= 0)
+            & (u_ref <= target_width - 1)
+            & (v_ref >= 0)
+            & (v_ref <= target_height - 1)
+        )
+        sample_grid = torch.stack(
+            [
+                u_ref / (target_width - 1) * 2 - 1,
+                v_ref / (target_height - 1) * 2 - 1,
+            ],
+            dim=-1,
+        )
+        sampled_depths = F.grid_sample(
+            ref_depths.permute(0, 3, 1, 2),
+            sample_grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        ).permute(0, 2, 3, 1)
+        sampled_colors = F.grid_sample(
+            ref_images.permute(0, 3, 1, 2),
+            sample_grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        ).permute(0, 2, 3, 1)
+
+        depth_weight = torch.exp(
+            -torch.abs(sampled_depths - z_ref) / self.cfg.warp_tau_depth
+        )
+        weights = inside[..., None].float() * depth_weight
+        weight_sum = weights.sum(dim=0)
+        ref_colors = (weights * sampled_colors).sum(dim=0) / (weight_sum + 1e-6)
+        gamma_vis = torch.clamp(weight_sum, 0.0, 1.0)
+
+        virtual_center = virtual_c2w[0, :3, 3]
+        ref_centers = ref_c2ws[:, :3, 3]
+        virtual_dirs = F.normalize(
+            virtual_center[None, None, :] - points_world, dim=-1
+        )
+        ref_dirs = F.normalize(
+            ref_centers[:, None, None, :] - points_world[None], dim=-1
+        )
+        d_max = (virtual_dirs[None] * ref_dirs).sum(dim=-1).max(dim=0).values
+        cos_theta_max = math.cos(math.radians(self.cfg.warp_theta_max_deg))
+        q_cam = torch.clamp(
+            (d_max[..., None] - cos_theta_max) / (1.0 - cos_theta_max),
+            0.0,
+            1.0,
+        )
+        warp_weight = (1.0 - q_cam) * gamma_vis
+        warp_weight = torch.where(
+            gamma_vis >= self.cfg.warp_min_gamma,
+            warp_weight,
+            torch.zeros_like(warp_weight),
+        )
+        robust = F.smooth_l1_loss(
+            virtual_colors[0], ref_colors.detach(), reduction="none"
+        ).mean(dim=-1, keepdim=True)
+        warp_loss = (robust * warp_weight.detach()).mean()
+        #warp_loss = robust.mean() #一時的にwarp_weightの効果を切る
+        debug = {
+            "I_virtual": virtual_colors[0].detach(),
+            "C_ref": ref_colors.detach(),
+            "gamma_vis": gamma_vis.detach(),
+            "q_cam": q_cam.detach(),
+            "final_weight": warp_weight.detach(),
+            "virtual_camera_source": virtual_camera_source,
+        }
+        if (
+            self.cfg.warp_save_camera_debug
+            and step % self.cfg.warp_camera_debug_interval == 0
+        ):
+            debug["camera_viewpoints"] = self._make_warp_camera_viz(
+                current_camtoworld, virtual_c2w, ref_c2ws, neighbor_idcs
+            )
+            debug["camera_debug"] = self._make_warp_camera_debug(
+                step,
+                current_idx,
+                virtual_camera_source,
+                neighbor_idcs,
+                current_camtoworld,
+                virtual_c2w,
+                ref_c2ws,
+                K_virtual,
+                ref_Ks,
+            )
+        return warp_loss, debug
+
+    def _compute_warp_loss(
+        self,
+        step: int,
+        current_camtoworld: Tensor,
+        current_K: Tensor,
+        current_image_id: Tensor,
+        sh_degree: int,
+        height: int,
+        width: int,
+    ) -> Tuple[Tensor, Optional[Dict[str, object]]]:
+        losses = []
+        debug = None
+        if self.manual_warp_cameras is None:
+            num_virtual_views = self.cfg.warp_num_virtual_views
+        else:
+            num_virtual_views = len(self.manual_warp_cameras["camtoworlds"])
+        for virtual_camera_index in range(num_virtual_views):
+            warp_loss, warp_debug = self._compute_single_warp_loss(
+                step,
+                current_camtoworld,
+                current_K,
+                current_image_id,
+                sh_degree,
+                height,
+                width,
+                virtual_camera_index,
+            )
+            losses.append(warp_loss)
+            if debug is None and warp_debug is not None:
+                debug = warp_debug
+        return torch.stack(losses).mean(), debug
+
+    def _compute_precomputed_warp_loss(
+        self,
+        step: int,
+        current_image_id: Tensor,
+        sh_degree: int,
+    ) -> Tuple[Tensor, Optional[Dict[str, object]]]:
+        if self.precomputed_virtual_refs is None:
+            raise RuntimeError("Precomputed virtual refs are not loaded.")
+        device = self.device
+        ref_index = (step - self.cfg.warp_start_iter) // self.cfg.virtual_ref_interval
+        ref_index = int(ref_index % len(self.precomputed_virtual_refs))
+        ref = self.precomputed_virtual_refs[ref_index]
+
+        c_ref = ref["C_ref"].to(device)
+        mask = ref["M_ref"].to(device)
+        weight_sum = ref["weight_sum"].to(device)
+        camtoworld = ref["camtoworld"].to(device).unsqueeze(0)
+        K = ref["K"].to(device).unsqueeze(0)
+        height, width = c_ref.shape[:2]
+
+        renders, _, _ = self.rasterize_splats(
+            camtoworlds=camtoworld,
+            Ks=K,
+            width=width,
+            height=height,
+            sh_degree=sh_degree,
+            near_plane=self.cfg.near_plane,
+            far_plane=self.cfg.far_plane,
+            image_ids=current_image_id,
+            render_mode="RGB",
+            frame_idcs=None,
+            camera_idcs=None,
+            exposure=None,
+        )
+        virtual_colors = renders[..., :3]
+        robust = F.smooth_l1_loss(
+            virtual_colors[0], c_ref.detach(), reduction="none"
+        ).mean(dim=-1)
+        mask_f = mask.float()
+        warp_loss = (robust * mask_f.detach()).sum() / (mask_f.sum() + 1e-6)
+        source_idx = int(ref["source_keyframe_index"].item())
+        debug = {
+            "I_virtual": virtual_colors[0].detach(),
+            "C_ref": c_ref.detach(),
+            "gamma_vis": weight_sum.detach()[..., None].clamp(0.0, 1.0),
+            "q_cam": torch.zeros_like(weight_sum.detach()[..., None]),
+            "final_weight": mask_f.detach()[..., None],
+            "virtual_camera_source": f"precomputed_ref_{source_idx}",
+        }
+        return warp_loss, debug
+
+    def _write_warp_debug_images(
+        self, warp_debug: Dict[str, object], step: int
+    ) -> None:
+        for name, image in warp_debug.items():
+            if not isinstance(image, Tensor):
+                continue
+            image = image.detach().clamp(0.0, 1.0).cpu()
+            if image.shape[-1] == 1:
+                image = image.repeat(1, 1, 3)
+            self.writer.add_image(f"warp/{name}", image, step, dataformats="HWC")
+
+    def _write_warp_virtual_images(
+        self, warp_debug: Dict[str, object], step: int
+    ) -> None:
+        virtual_camera_source = str(warp_debug.get("virtual_camera_source", "unknown"))
+        safe_source = "".join(
+            c if c.isalnum() or c in {"-", "_"} else "_"
+            for c in virtual_camera_source
+        )
+        save_dir = Path(self.cfg.result_dir) / "warp_virtual_images" / safe_source
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        for name in ("I_virtual", "C_ref"):
+            image = warp_debug.get(name)
+            if not isinstance(image, Tensor):
+                continue
+            image = image.detach().clamp(0.0, 1.0)
+            if image.shape[-1] == 1:
+                image = image.repeat(1, 1, 3)
+            image = image.mul(255.0).byte().cpu().numpy()
+            imageio.imwrite(save_dir / f"step_{step:06d}_{name}.png", image)
+
+    def _write_warp_camera_debug_json(
+        self, warp_debug: Dict[str, object], step: int
+    ) -> None:
+        camera_debug = warp_debug.get("camera_debug")
+        if camera_debug is None:
+            return
+        debug_dir = Path(self.cfg.result_dir) / "warp_camera_debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        with open(debug_dir / f"step_{step:06d}_rank{self.world_rank}.json", "w") as f:
+            json.dump(camera_debug, f, indent=2)
 
     def train(self):
         cfg = self.cfg
@@ -951,6 +2014,30 @@ class Runner:
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
+            warp_loss = None
+            warp_debug = None
+            if (
+                cfg.use_warp_loss
+                and step >= cfg.warp_start_iter
+                and step % cfg.warp_interval == 0
+            ):
+                if cfg.use_precomputed_virtual_refs:
+                    warp_loss, warp_debug = self._compute_precomputed_warp_loss(
+                        step=step,
+                        current_image_id=image_ids,
+                        sh_degree=sh_degree_to_use,
+                    )
+                else:
+                    warp_loss, warp_debug = self._compute_warp_loss(
+                        step=step,
+                        current_camtoworld=camtoworlds,
+                        current_K=Ks,
+                        current_image_id=image_ids,
+                        sh_degree=sh_degree_to_use,
+                        height=height,
+                        width=width,
+                    )
+                loss += cfg.lambda_warp * warp_loss
             if cfg.post_processing == "bilateral_grid":
                 post_processing_reg_loss = 10 * total_variation_loss(
                     self.post_processing_module.grids
@@ -973,11 +2060,20 @@ class Runner:
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
+            if warp_loss is not None:
+                desc += f"warp loss={warp_loss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
                 desc += f"pose err={pose_err.item():.6f}| "
             pbar.set_description(desc)
+            if (
+                world_rank == 0
+                and cfg.warp_save_camera_debug
+                and warp_debug is not None
+            ):
+                self._write_warp_camera_debug_json(warp_debug, step)
+                self._write_warp_virtual_images(warp_debug, step)
 
             # write images (gt and render)
             # if world_rank == 0 and step % 800 == 0:
@@ -997,6 +2093,8 @@ class Runner:
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                if warp_loss is not None:
+                    self.writer.add_scalar("train/warp_loss", warp_loss.item(), step)
                 if cfg.post_processing is not None:
                     self.writer.add_scalar(
                         "train/post_processing_reg_loss",
@@ -1007,6 +2105,8 @@ class Runner:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
                     self.writer.add_image("train/render", canvas, step, dataformats="HWC")
+                    if warp_debug is not None:
+                        self._write_warp_debug_images(warp_debug, step)
                 self.writer.flush()
 
             # save checkpoint before updating the model

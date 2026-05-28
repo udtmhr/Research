@@ -33,9 +33,30 @@ from nerfview import CameraState, RenderTabState, apply_float_colormap
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 
 
+def resolve_viewer_output_dir(output_dir: str, ckpts: list[str] | None = None) -> Path:
+    """Resolve result dir used by nerfview for camera path/video outputs."""
+    if ckpts:
+        ckpt_dir = Path(ckpts[0]).parent
+        if ckpt_dir.name in {"ckpt", "ckpts"}:
+            return ckpt_dir.parent
+        return ckpt_dir
+
+    path = Path(output_dir)
+    if path.is_absolute():
+        return path
+
+    examples_dir = Path(__file__).resolve().parent
+    if len(path.parts) > 0 and path.parts[0] == "results":
+        examples_results = examples_dir / "results"
+        if examples_results.exists():
+            return examples_dir / path
+    return path
+
+
 def main(local_rank: int, world_rank, world_size: int, args):
     torch.manual_seed(42)
     device = torch.device("cuda", local_rank)
+    output_dir = resolve_viewer_output_dir(args.output_dir, args.ckpt)
 
     is_ps = False
     if args.ckpt is None:
@@ -97,7 +118,7 @@ def main(local_rank: int, world_rank, world_size: int, args):
         render_depths = render_depths / render_depths.max()
 
         # dump batch images
-        os.makedirs(args.output_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
         canvas = (
             torch.cat(
                 [
@@ -112,7 +133,7 @@ def main(local_rank: int, world_rank, world_size: int, args):
             .numpy()
         )
         imageio.imsave(
-            f"{args.output_dir}/render_rank{world_rank}.png",
+            output_dir / f"render_rank{world_rank}.png",
             (canvas * 255).astype(np.uint8),
         )
     else:
@@ -256,7 +277,7 @@ def main(local_rank: int, world_rank, world_size: int, args):
     _ = GsplatViewer(
         server=server,
         render_fn=viewer_render_fn,
-        output_dir=Path(args.output_dir),
+        output_dir=output_dir,
         mode="rendering",
     )
     print("Viewer running... Ctrl+C to exit.")
