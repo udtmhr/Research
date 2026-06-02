@@ -57,6 +57,8 @@ def project_points_to_depth(
     height: int,
     width: int,
     splat_radius: int,
+    sigma_s: float,
+    tau: float,
 ) -> np.ndarray:
     worldtocam = np.linalg.inv(camtoworld)
     points_cam = (worldtocam[:3, :3] @ points_world.T + worldtocam[:3, 3:4]).T
@@ -69,20 +71,46 @@ def project_points_to_depth(
     x = np.rint(uv[:, 0]).astype(np.int64)
     y = np.rint(uv[:, 1]).astype(np.int64)
 
-    depth = np.full((height, width), np.inf, dtype=np.float32)
+    numerator = np.zeros((height, width), dtype=np.float32)
+    denominator = np.zeros((height, width), dtype=np.float32)
+    min_depth = np.full((height, width), np.inf, dtype=np.float32)
     radius = max(0, int(splat_radius))
+    sigma_s = max(float(sigma_s), 1e-6)
+    tau = max(float(tau), 1e-6)
     offsets = [
         (dy, dx)
         for dy in range(-radius, radius + 1)
         for dx in range(-radius, radius + 1)
         if dx * dx + dy * dy <= radius * radius
     ] or [(0, 0)]
+
     for dy, dx in offsets:
         xx = x + dx
         yy = y + dy
         inside = (xx >= 0) & (xx < width) & (yy >= 0) & (yy < height)
-        np.minimum.at(depth, (yy[inside], xx[inside]), z[inside].astype(np.float32))
-    depth[~np.isfinite(depth)] = 0.0
+        np.minimum.at(min_depth, (yy[inside], xx[inside]), z[inside].astype(np.float32))
+
+    for dy, dx in offsets:
+        xx = x + dx
+        yy = y + dy
+        inside = (xx >= 0) & (xx < width) & (yy >= 0) & (yy < height)
+        if not np.any(inside):
+            continue
+        dist2 = (xx[inside].astype(np.float32) - uv[inside, 0]) ** 2 + (
+            yy[inside].astype(np.float32) - uv[inside, 1]
+        ) ** 2
+        spatial_weight = np.exp(-dist2 / (2.0 * sigma_s * sigma_s)).astype(np.float32)
+        # Subtracting the per-pixel minimum z keeps the soft z-buffer numerically stable.
+        z_inside = z[inside].astype(np.float32)
+        z_weight = np.exp(
+            -(z_inside - min_depth[yy[inside], xx[inside]]) / tau
+        ).astype(np.float32)
+        weight = spatial_weight * z_weight
+        np.add.at(numerator, (yy[inside], xx[inside]), weight * z_inside)
+        np.add.at(denominator, (yy[inside], xx[inside]), weight)
+
+    depth = numerator / (denominator + 1e-6)
+    depth[denominator <= 0.0] = 0.0
     return depth
 
 
@@ -176,10 +204,22 @@ def resize_tensor_hwc(array: np.ndarray, height: int, width: int, mode: str = "b
     return resized[0].permute(1, 2, 0).numpy()
 
 
+def downsample_hwc(array: np.ndarray, height: int, width: int, mode: str = "area") -> np.ndarray:
+    tensor = torch.from_numpy(array).float()
+    if tensor.ndim == 2:
+        tensor = tensor[None, None]
+    else:
+        tensor = tensor.permute(2, 0, 1).unsqueeze(0)
+    resized = F.interpolate(tensor, size=(height, width), mode=mode)
+    if array.ndim == 2:
+        return resized[0, 0].numpy()
+    return resized[0].permute(1, 2, 0).numpy()
+
+
 def save_debug_images(debug_dir: Path, c_ref: np.ndarray, mask: np.ndarray, weight_sum: np.ndarray, depth: np.ndarray) -> None:
     debug_dir.mkdir(parents=True, exist_ok=True)
     imageio.imwrite(debug_dir / "C_ref.png", np.clip(c_ref * 255.0, 0, 255).astype(np.uint8))
-    imageio.imwrite(debug_dir / "M_ref.png", (mask.astype(np.uint8) * 255))
+    imageio.imwrite(debug_dir / "M_ref.png", np.clip(mask * 255.0, 0, 255).astype(np.uint8))
     weight_norm = weight_sum / max(float(np.percentile(weight_sum, 99.0)), 1e-6)
     imageio.imwrite(debug_dir / "weight_sum.png", np.clip(weight_norm * 255.0, 0, 255).astype(np.uint8))
     valid = depth > 0.0
@@ -200,11 +240,29 @@ def main() -> None:
     parser.add_argument("--virtual-camera-path", type=Path, default=Path("camera_paths/virtual.json"))
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--warp-downsample", type=int, default=2)
+    parser.add_argument(
+        "--virtual-supersample",
+        type=int,
+        default=1,
+        help="Compute virtual refs at Nx resolution and area-downsample to reduce jagged silhouettes.",
+    )
     parser.add_argument("--tau-z", type=float, default=0.01)
     parser.add_argument("--view-gamma", type=float, default=4.0)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--min-weight-sum", type=float, default=0.05)
     parser.add_argument("--splat-radius", type=int, default=2)
+    parser.add_argument(
+        "--soft-z-sigma-s",
+        type=float,
+        default=None,
+        help="Pixel-space Gaussian sigma for soft z-buffer splatting. Defaults to splat_radius / 2.",
+    )
+    parser.add_argument(
+        "--soft-z-tau",
+        type=float,
+        default=0.05,
+        help="Depth temperature for soft z-buffer. Smaller values prioritize nearer points.",
+    )
     parser.add_argument("--manual-camera-scale-ratio", type=float, default=10.0)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -236,8 +294,14 @@ def main() -> None:
     train_indices = np.asarray(trainset.indices)
     first_camera_id = parser_obj.camera_ids[int(train_indices[0])]
     source_width, source_height = parser_obj.imsize_dict[first_camera_id]
-    height = max(2, int(source_height) // max(1, args.warp_downsample))
-    width = max(2, int(source_width) // max(1, args.warp_downsample))
+    out_height = max(2, int(source_height) // max(1, args.warp_downsample))
+    out_width = max(2, int(source_width) // max(1, args.warp_downsample))
+    supersample = max(1, int(args.virtual_supersample))
+    height = out_height * supersample
+    width = out_width * supersample
+    soft_z_sigma_s = args.soft_z_sigma_s
+    if soft_z_sigma_s is None:
+        soft_z_sigma_s = max(float(args.splat_radius) * 0.5, 1.0)
 
     ref_c2ws = parser_obj.camtoworlds[train_indices].astype(np.float32)
     ref_centers = ref_c2ws[:, :3, 3]
@@ -271,7 +335,14 @@ def main() -> None:
     for virtual_idx, virtual_c2w in enumerate(tqdm.tqdm(camtoworlds_virtual, desc="Virtual refs")):
         K_virtual = make_k_from_fov(fovs[virtual_idx], height, width)
         depth_virtual = project_points_to_depth(
-            points_world, virtual_c2w, K_virtual, height, width, args.splat_radius
+            points_world,
+            virtual_c2w,
+            K_virtual,
+            height,
+            width,
+            args.splat_radius,
+            soft_z_sigma_s,
+            args.soft_z_tau,
         )
         valid_virtual = depth_virtual.reshape(-1) > 0.0
         points = backproject_depth(depth_virtual, virtual_c2w, K_virtual).reshape(-1, 3)
@@ -317,10 +388,18 @@ def main() -> None:
 
         weight_sum = top_weights.sum(axis=0)
         c_ref = (top_weights[..., None] * top_colors).sum(axis=0) / (weight_sum[:, None] + 1e-6)
-        mask = weight_sum >= args.min_weight_sum
+        mask = (weight_sum >= args.min_weight_sum).astype(np.float32)
         c_ref = c_ref.reshape(height, width, 3).astype(np.float32)
-        mask = mask.reshape(height, width)
+        mask = mask.reshape(height, width).astype(np.float32)
         weight_sum = weight_sum.reshape(height, width).astype(np.float32)
+        if supersample > 1:
+            c_ref_premult = c_ref * mask[..., None]
+            c_ref_premult = downsample_hwc(c_ref_premult, out_height, out_width)
+            mask = downsample_hwc(mask, out_height, out_width).astype(np.float32)
+            c_ref = c_ref_premult / np.clip(mask[..., None], 1e-6, None)
+            c_ref = np.where(mask[..., None] > 1e-6, c_ref, 0.0).astype(np.float32)
+            weight_sum = downsample_hwc(weight_sum, out_height, out_width).astype(np.float32)
+            depth_virtual = downsample_hwc(depth_virtual, out_height, out_width).astype(np.float32)
 
         out_path = virtual_ref_dir / f"ref_{virtual_idx:04d}.npz"
         np.savez_compressed(

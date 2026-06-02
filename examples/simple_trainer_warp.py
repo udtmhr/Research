@@ -1192,7 +1192,7 @@ class Runner:
             refs.append(
                 {
                     "C_ref": torch.from_numpy(data["C_ref"].astype(np.float32)),
-                    "M_ref": torch.from_numpy(data["M_ref"].astype(bool)),
+                    "M_ref": torch.from_numpy(data["M_ref"].astype(np.float32)),
                     "weight_sum": torch.from_numpy(data["weight_sum"].astype(np.float32)),
                     "depth_virtual": torch.from_numpy(data["depth_virtual"].astype(np.float32)),
                     "camtoworld": torch.from_numpy(data["camtoworld"].astype(np.float32)),
@@ -1744,7 +1744,7 @@ class Runner:
         ref = self.precomputed_virtual_refs[ref_index]
 
         c_ref = ref["C_ref"].to(device)
-        mask = ref["M_ref"].to(device)
+        mask = ref["M_ref"].to(device).float().clamp(0.0, 1.0)
         weight_sum = ref["weight_sum"].to(device)
         camtoworld = ref["camtoworld"].to(device).unsqueeze(0)
         K = ref["K"].to(device).unsqueeze(0)
@@ -1768,7 +1768,7 @@ class Runner:
         robust = F.smooth_l1_loss(
             virtual_colors[0], c_ref.detach(), reduction="none"
         ).mean(dim=-1)
-        mask_f = mask.float()
+        mask_f = mask
         warp_loss = (robust * mask_f.detach()).sum() / (mask_f.sum() + 1e-6)
         source_idx = int(ref["source_keyframe_index"].item())
         debug = {
